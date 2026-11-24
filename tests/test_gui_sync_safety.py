@@ -311,17 +311,24 @@ def test_reorder_with_pending_remove_keeps_intended_order(app, gui_env):
     assert _titles(app, pid) == ["Song Four", "Song Two", "Song Three"]
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "needs CORE A5: manager.remove_track drops the track from the Store "
+    "before deleting the file, so a failed delete loses the entry. Remove "
+    "this marker when the CORE fix lands (strict: it then XPASSes and fails)."))
 def test_failed_remove_keeps_reorder_and_remove_valid(app, gui_env):
     """#3/#6: after a partial sync the remaining staged ops still point at the
-    right tracks (keys are rebased onto the new store)."""
+    right tracks (keys are rebased onto the new store).
+
+    T1: the failure is injected at the device delete (writer.delete), not by
+    replacing the whole manager.remove_track, so the test covers what
+    remove_track does to the Store when the delete fails."""
     pid = _synced_playlist(app, gui_env, 3)
     tracks = app.mgr.store.playlists[pid]["tracks"]
     app._stage_remove_track(pid, 1, tracks[0]["copy_name"])
     app._stage_add_files([_sources(gui_env)[3]])
     app.staging.set_reorder(pid, [{"key": "p:0"}, {"key": "c:3"}, {"key": "c:2"}])
 
-    real_remove = app.mgr.remove_track
-    with patch.object(app.mgr, "remove_track",
+    with patch.object(app.mgr.writer, "delete",
                       side_effect=PermissionError(errno.EACCES, "Permission denied")):
         errors = app._do_sync_blocking()
     assert errors
@@ -330,7 +337,7 @@ def test_failed_remove_keeps_reorder_and_remove_valid(app, gui_env):
     assert len(app.staging.pending_removes) == 1
     assert pid in app.staging.pending_reorders
 
-    assert real_remove  # second sync uses the real remove
+    _reopen(app, gui_env)
     assert app._do_sync_blocking() == []
     assert _titles(app, pid) == ["Song Four", "Song Three", "Song Two"]
 
