@@ -51,3 +51,16 @@ def pad_width(track_count: int) -> int:
 
 def track_filename(index: int, title: str, ext: str, pad: int = 2) -> str:
     return f"{index:0{pad}d} - {sanitize(title)}{ext}"
+
+
+def check_playlist_folder_name(folder: str) -> None:
+    """Raise ValueError for a folder name a playlist must never use.
+
+    Dot-folders are hidden on the player and on macOS, and ``.echolist``
+    holds the workspace's config, store and lock: a playlist backed by it
+    would be deleted recursively along with the playlist.
+    """
+    if folder.startswith("."):
+        raise ValueError(
+            f"A playlist folder can't start with a dot ({folder!r}); "
+            "rename the playlist.")
