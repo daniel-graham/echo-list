@@ -42,7 +42,7 @@ class SafeWriter:
         _atomic_write(p, data)
         return p
 
-    def copy_in(self, src, rel, progress_cb=None, compute_hash=False):
+    def copy_in(self, src, rel, progress_cb=None, compute_hash=False, before_commit=None):
         """Copy src into the workspace at rel, atomically and durably.
 
         The bytes go to a hidden ``.part`` temp file in the destination
@@ -51,6 +51,11 @@ class SafeWriter:
         file and leaves nothing at ``rel``. The ``.part`` suffix is not an
         audio extension, so a temp file stranded by a hard crash is never
         adopted as a track by ``rescan_playlist``.
+
+        ``before_commit(tmp_path)``, if given, runs on the complete temp copy
+        before the fsync and rename (e.g. to write tags), so the file never
+        appears at ``rel`` in an unfinished state; if it raises, nothing is
+        left at ``rel``. The temp path has a ``.part`` suffix, not rel's.
 
         Only timestamps are carried over from src — never permission bits or
         BSD flags, which would make the copy read-only (un-taggable) or fail
@@ -79,7 +84,11 @@ class SafeWriter:
                     if progress_cb:
                         progress_cb(copied, total)
                 fdst.flush()
-                os.fsync(fdst.fileno())
+                if before_commit is None:
+                    os.fsync(fdst.fileno())
+            if before_commit is not None:
+                before_commit(Path(tmp))
+                _fsync_path(tmp)
             os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
             os.replace(tmp, dest)
         except BaseException:
@@ -107,6 +116,15 @@ class SafeWriter:
 
     def resolve(self, rel) -> Path:
         return self._resolve(rel)
+
+
+def _fsync_path(path) -> None:
+    # O_RDWR: Windows' fsync (_commit) needs a writable handle.
+    fd = os.open(path, os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _unlink_quiet(path) -> None:

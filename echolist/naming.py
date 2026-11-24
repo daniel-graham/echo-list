@@ -36,5 +36,18 @@ def playlist_id(name: str) -> str:
     return re.sub(r"\.{2,}", lambda m: "_" * len(m.group()), pid)
 
 
+# Leading "NN - " index prefix that track_filename writes.
+INDEX_PREFIX_RE = re.compile(r"^\d+ - ")
+
+
+def pad_width(track_count: int) -> int:
+    """Zero-pad width for every index prefix in a playlist of this size.
+
+    The whole playlist shares one width so that sorting file names
+    lexicographically gives playlist order ("099" < "100", but "99" > "100").
+    """
+    return max(2, len(str(track_count)))
+
+
 def track_filename(index: int, title: str, ext: str, pad: int = 2) -> str:
     return f"{index:0{pad}d} - {sanitize(title)}{ext}"
