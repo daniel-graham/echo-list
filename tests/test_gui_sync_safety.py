@@ -7,7 +7,6 @@ comment on each test names the defect it pins down.
 import errno
 import signal
 import threading
-import time
 import unicodedata
 from pathlib import Path
 from unittest.mock import patch
@@ -17,7 +16,8 @@ import pytest
 import echolist.gui as gui
 from echolist.journal import SyncJournal
 from conftest import _make_flac
-from test_gui import app, gui_env, _flush_bg_ops, _flush_tracks  # noqa: F401  (fixtures)
+from test_gui import (app, gui_env, isolated_home, callback_errors,  # noqa: F401  (fixtures)
+                      pump, _flush_bg_ops, _flush_tracks)
 
 
 class Crash(BaseException):
@@ -90,12 +90,8 @@ def _reopen(app, gui_env):
     return _open(app, gui_env["src"], gui_env["dest"])
 
 
-def _wait_sync(app, timeout=10):
-    deadline = time.monotonic() + timeout
-    while app._syncing and time.monotonic() < deadline:
-        app.root.update()
-        time.sleep(0.02)
-    app.root.update()
+def _wait_sync(app):
+    pump(app)
 
 
 # ── #1 crash recovery must never delete audio ──
