@@ -661,17 +661,66 @@ def test_restore_deleted_stages_under_the_recreated_playlist_id(app, gui_env):
 
 # ── A13 / N2 (GUI part): restores and staged changes ──
 
-def test_restore_point_is_refused_while_the_playlist_has_staged_changes(app, gui_env):
-    """A13/N2: restoring rewrote the playlist under staged removes/reorders
-    whose indices then pointed at other tracks."""
+def test_restore_point_replaces_the_playlists_staged_changes(app, gui_env):
+    """A13/N2 (CORE handoff 2): restoring rewrote the playlist under staged
+    removes/reorders whose indices then pointed at other tracks. The restore
+    now discards that playlist's staged changes (and undo) first; other
+    playlists keep theirs."""
     pid = _synced_playlist(app, gui_env, 2)
     app.mgr.backup_playlist_metadata(pid, timestamp="20200101_000000")
+    app._create_playlist()
+    other = app.current_pid
+    app._stage_add_files(_sources(gui_env)[2:3])
     app._stage_remove_track(pid, 1, _track(app, pid, 1)["copy_name"])
-    with patch.object(app.mgr, "restore_playlist_to_point") as restore, _quiet():
+    app.staging.set_reorder(pid, [{"key": "c:2"}, {"key": "c:1"}])
+
+    with _quiet():
         app._restore_from_point(pid, "20200101_000000")
         pump(app)
-    restore.assert_not_called()
-    assert len(app.staging.pending_removes) == 1
+
+    assert not app.staging.pending_removes
+    assert pid not in app.staging.pending_reorders
+    assert [a["pid"] for a in app.staging.pending_adds] == [other]
+    assert not app._undo_stack
+    assert _titles(app, pid) == ["Song One", "Song Two"]
+
+
+def test_restore_point_puts_restaged_tracks_back_in_their_place(app, gui_env):
+    """CORE handoff 1: to_stage entries carry the position they had in the
+    restore point; staging them as plain adds put them at the end."""
+    pid = _synced_playlist(app, gui_env, 3)
+    app.mgr.backup_playlist_metadata(pid, timestamp="20200101_000000")
+    app._stage_remove_track(pid, 1, _track(app, pid, 1)["copy_name"])
+    assert app._do_sync_blocking() == []
+    assert _titles(app, pid) == ["Song Two", "Song Three"]
+
+    with _quiet():
+        app.current_pid = pid
+        app._restore_from_point(pid, "20200101_000000")
+        pump(app)
+    assert [r["title"] for r in app._track_data] == ["Song One", "Song Two", "Song Three"]
+    assert app._do_sync_blocking() == []
+    assert _titles(app, pid) == ["Song One", "Song Two", "Song Three"]
+
+
+def test_restore_point_reports_what_it_could_not_do(app, gui_env):
+    """CORE handoff 1: files the card refused to delete come back in
+    "failed"; the summary never mentioned them."""
+    pid = _synced_playlist(app, gui_env, 1)
+    app.mgr.backup_playlist_metadata(pid, timestamp="20200101_000000")
+    app._stage_add_files(_sources(gui_env)[1:2])
+    assert app._do_sync_blocking() == []
+    extra = _track(app, pid, 2)["copy_name"]
+
+    with patch.object(app.mgr.writer, "delete",
+                      side_effect=PermissionError(errno.EACCES, "Permission denied")), \
+            patch("echolist.gui.messagebox.askyesno", return_value=True), \
+            patch("echolist.gui.messagebox.showinfo") as info, \
+            patch("echolist.gui.messagebox.showwarning") as warn:
+        app._restore_from_point(pid, "20200101_000000")
+        pump(app)
+    text = " ".join(str(c) for c in info.call_args_list + warn.call_args_list)
+    assert extra in text
 
 
 def test_undo_after_a_restore_does_not_unstage_its_tracks(app, gui_env):
@@ -793,3 +842,83 @@ def test_declining_an_orphan_remove_still_clears_the_shifted_reorder(app, gui_en
 
     assert [a["title"] for a in app.staging.pending_adds] == ["Song Three"]
     assert pid not in app.staging.pending_reorders
+
+
+# ── CORE handoff 3: a folder already on the card blocks one restored playlist ──
+
+def test_snapshot_restore_reports_a_playlist_whose_folder_exists(app, gui_env, tmp_path):
+    """create_playlist now refuses a folder that already exists on the card;
+    the snapshot restore must say which playlist was not restored and why,
+    instead of counting its tracks as missing sources."""
+    card = tmp_path / "card2"
+    (card / gui.DEFAULT_PLAYLIST_FOLDER / "AC_DC").mkdir(parents=True)
+    snapshot = {
+        "config": {"source_root": str(gui_env["src"]),
+                   "playlist_folder": gui.DEFAULT_PLAYLIST_FOLDER},
+        "store": {"schema": 1, "playlists": {"ac_dc": {
+            "name": "AC/DC", "folder": "AC_DC",
+            "tracks": [{"index": 1, "copy_name": "01 - Song One.flac",
+                        "src_path": "ArtistA/Album1/01 Song One.flac"}]}}},
+    }
+    app.mgr.release_lock()
+    with patch.object(gui.PlaylistManager, "find_snapshot", return_value=snapshot), \
+            patch("echolist.gui.messagebox.askyesno", return_value=True), \
+            patch("echolist.gui.messagebox.showwarning") as warn, \
+            patch("echolist.gui.messagebox.showinfo"):
+        app._open_workspace(str(gui_env["src"]), str(card))
+    pump(app)
+    text = " ".join(str(c) for c in warn.call_args_list)
+    assert "AC/DC" in text and "not restored" in text
+    assert not app.staging.pending_adds
+
+
+# ── CORE handoff 4: rename checks the folder name the way the card does ──
+
+def test_rename_refuses_a_dot_folder(app, gui_env):
+    pid = _synced_playlist(app, gui_env, 1)
+    folder = app.mgr.store.playlists[pid]["folder"]
+    with patch("echolist.gui.messagebox.showerror") as err:
+        assert not app._rename_playlist(pid, ".Hidden")
+    err.assert_called_once()
+    assert app.mgr.store.playlists[pid]["folder"] == folder
+    assert (app.mgr.writer.root / folder).is_dir()
+
+
+def test_rename_refuses_a_folder_differing_only_in_unicode_form(app, gui_env):
+    """macOS (and so the card as macOS sees it) treats NFC and NFD names as
+    one; the casefold-only compare let two playlists share a folder."""
+    app.mgr.create_playlist("Café")
+    pid = _synced_playlist(app, gui_env, 1)
+    with patch("echolist.gui.messagebox.showerror") as err:
+        assert not app._rename_playlist(pid, "CAFÉ")
+    err.assert_called_once()
+
+
+# ── CORE handoff 5 / 6: reorder retags through the writer; one TMP_PREFIX ──
+
+def test_reorder_retags_through_writer_edit_in_place(app, gui_env):
+    """Tag writes re-create macOS ._ sidecars on FAT32; edit_in_place drops
+    them. _commit_reorder wrote the tags directly."""
+    pid = _synced_playlist(app, gui_env, 2)
+    app.staging.set_reorder(pid, [{"key": "c:2"}, {"key": "c:1"}])
+    real = app.mgr.writer.edit_in_place
+    edited = []
+
+    def spy(rel, edit):
+        edited.append(Path(rel).name)
+        return real(rel, edit)
+
+    with patch.object(app.mgr.writer, "edit_in_place", side_effect=spy):
+        assert app._do_sync_blocking() == []
+    assert sorted(edited) == ["01 - Song Two.flac", "02 - Song One.flac"]
+
+
+def test_gui_does_not_redefine_tmp_prefix():
+    """The parking prefix is defined once, in manager.py (rescan ignores it,
+    recovery restores it); gui.py must import it, not keep a copy."""
+    import inspect
+    import re
+    from echolist import manager
+    assert not re.search(r"^TMP_PREFIX\s*=", inspect.getsource(gui), re.M), (
+        "gui.py defines TMP_PREFIX; use `from .manager import TMP_PREFIX`")
+    assert gui.TMP_PREFIX == manager.TMP_PREFIX
