@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 
 def parse_m3u(m3u_path: Path, source_root: Path | None = None) -> dict:
@@ -15,9 +17,10 @@ def parse_m3u(m3u_path: Path, source_root: Path | None = None) -> dict:
     m3u_path = Path(m3u_path)
     name = m3u_path.stem
 
-    encoding = "utf-8" if m3u_path.suffix.lower() == ".m3u8" else "utf-8-sig"
+    # utf-8-sig for both: Windows players write .m3u8 files with a BOM, and
+    # "\ufeff#EXTM3U" would otherwise be read as a track path.
     try:
-        lines = m3u_path.read_text(encoding=encoding).splitlines()
+        lines = m3u_path.read_text(encoding="utf-8-sig").splitlines()
     except UnicodeDecodeError:
         lines = m3u_path.read_text(encoding="cp1252").splitlines()
 
@@ -35,7 +38,13 @@ def parse_m3u(m3u_path: Path, source_root: Path | None = None) -> dict:
         if line.startswith(("http://", "https://", "mms://", "rtsp://")):
             continue
 
-        entry = line.translate({ord("\\"): "/"})
+        if line[:7].lower() == "file://":
+            entry = _file_uri_to_path(line)
+            if entry is None:
+                missing.append(line)
+                continue
+        else:
+            entry = line.translate({ord("\\"): "/"})
         resolved = _resolve_entry(entry, m3u_path.parent, source_root)
         if resolved and resolved.is_file():
             tracks.append(resolved)
@@ -43,6 +52,19 @@ def parse_m3u(m3u_path: Path, source_root: Path | None = None) -> dict:
             missing.append(line)
 
     return {"name": name, "tracks": tracks, "missing": missing}
+
+
+def _file_uri_to_path(uri: str) -> str | None:
+    """file:///a/b%20c.flac or file://localhost/a/... -> "/a/b c.flac".
+
+    Returns None for a file URI naming another host, which cannot be read
+    as a local path.
+    """
+    parts = urlsplit(uri)
+    if parts.netloc not in ("", "localhost"):
+        return None
+    # url2pathname percent-decodes (and handles drive letters on Windows).
+    return url2pathname(parts.path)
 
 
 def _resolve_entry(entry: str, m3u_dir: Path, source_root: Path | None) -> Path | None:
