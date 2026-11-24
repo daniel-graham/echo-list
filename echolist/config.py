@@ -32,11 +32,59 @@ def load_defaults() -> dict:
     return {}
 
 
-def save_defaults(source: str, dest: str) -> None:
+def save_defaults(source: str, dest: str,
+                  playlist_folder: str = "Playlists") -> None:
+    """Remember the last workspace, including its playlist folder.
+
+    The folder must be stored too: without it the next launch opens
+    ``<dest>/Playlists`` and silently starts a second, empty workspace.
+    """
     _atomic_write_text(DEFAULT_FILE, json.dumps({
         "source": str(Path(source).resolve()),
         "dest": str(Path(dest).resolve()),
+        "playlist_folder": playlist_folder,
     }))
+
+
+def validate_playlist_folder(dest: str | Path, folder: str) -> str:
+    """Return ``folder`` stripped, or raise ValueError if it is unusable.
+
+    The playlist folder is joined onto the destination, so it must be a
+    relative path that stays strictly inside it (no absolute paths, no ``..``).
+    """
+    folder = folder.strip()
+    if not folder:
+        raise ValueError("The playlist folder name is empty.")
+    p = Path(folder)
+    if p.is_absolute() or p.anchor or ".." in p.parts:
+        raise ValueError(
+            f"Playlist folder {folder!r} must be a folder name inside the "
+            f"destination, not an absolute path or a path with '..'.")
+    dest_root = Path(dest).resolve()
+    resolved = (dest_root / p).resolve()
+    if resolved == dest_root or not resolved.is_relative_to(dest_root):
+        raise ValueError(
+            f"Playlist folder {folder!r} resolves outside the destination "
+            f"{dest_root}.")
+    return folder
+
+
+# ── Per-workspace local state (~/.echolist/backups/<wid>/) ──
+#
+# Staged changes and the sync journal describe one workspace (one card), so
+# they live next to that workspace's backups instead of in a global file that
+# would replay card A's changes against card B.
+
+def workspace_state_dir(workspace_root: str | Path) -> Path:
+    return BACKUPS_ROOT / _workspace_id(workspace_root)
+
+
+def pending_file(workspace_root: str | Path) -> Path:
+    return workspace_state_dir(workspace_root) / "pending.json"
+
+
+def journal_file(workspace_root: str | Path) -> Path:
+    return workspace_state_dir(workspace_root) / "sync_journal.json"
 
 
 # ── Metadata backups (stored in ~/.echolist/backups/) ──
@@ -77,65 +125,82 @@ def list_all_backup_pids(workspace_root: str | Path) -> list[str]:
     )
 
 
+def _backup_dir(workspace_root: str | Path, pid: str, legacy: bool = False) -> Path:
+    """Resolve ``~/.echolist/backups/<wid>/<pid>`` and refuse anything outside it.
+
+    New pids come from playlist_id() and never contain separators. Stores
+    written before playlist_id() was sanitized can hold pids such as
+    ``"rock/pop"`` whose backups live in nested folders; ``legacy=True``
+    accepts those as long as they stay inside this workspace's backup folder.
+    """
+    if not pid or (not legacy and ("/" in pid or "\\" in pid)):
+        raise ValueError(f"invalid playlist id: {pid!r}")
+    base = (BACKUPS_ROOT / _workspace_id(workspace_root)).resolve()
+    d = (base / pid).resolve()
+    if d == base or not d.is_relative_to(base):
+        raise ValueError(f"backup path escapes backups root: {d}")
+    return d
+
+
+def _remove_empty_dirs(d: Path, stop: Path) -> None:
+    """rmdir ``d`` and its now-empty parents, up to (not including) ``stop``."""
+    while d != stop and d.is_relative_to(stop):
+        try:
+            d.rmdir()
+        except OSError:  # not empty (or already gone): stop climbing
+            return
+        d = d.parent
+
+
 def rename_backup_pid(workspace_root: str | Path, old_pid: str, new_pid: str,
                       new_folder: str | None = None) -> None:
     """Move all backups from old_pid to new_pid directory.
 
     If new_folder is provided, update the 'folder' field inside each backup
-    so restore operations look in the correct location.
+    so restore operations look in the correct location — also when the pid
+    is unchanged (e.g. a case-only rename "road trip" -> "Road Trip").
     """
-    if old_pid == new_pid:
-        return
-    for pid in (old_pid, new_pid):
-        if not pid or ".." in pid or "/" in pid or "\\" in pid:
-            raise ValueError(f"invalid playlist id: {pid!r}")
-    wid = _workspace_id(workspace_root)
-    old_dir = (BACKUPS_ROOT / wid / old_pid).resolve()
-    if not str(old_dir).startswith(str(BACKUPS_ROOT.resolve())):
-        raise ValueError(f"backup path escapes backups root: {old_dir}")
+    old_dir = _backup_dir(workspace_root, old_pid, legacy=True)
+    new_dir = _backup_dir(workspace_root, new_pid)
     if not old_dir.exists():
         return
-    new_dir = BACKUPS_ROOT / wid / new_pid
     new_dir.mkdir(parents=True, exist_ok=True)
     for f in old_dir.iterdir():
-        if f.is_file() and f.suffix == ".json":
-            if new_folder:
-                try:
-                    data = json.loads(f.read_text(encoding="utf-8"))
-                    data["folder"] = new_folder
-                    _atomic_write_text(new_dir / f.name, json.dumps(data, indent=2))
-                    f.unlink()
-                except Exception:
-                    f.rename(new_dir / f.name)
-            else:
-                f.rename(new_dir / f.name)
-    try:
-        old_dir.rmdir()
-    except OSError:
-        pass
+        if not (f.is_file() and f.suffix == ".json"):
+            continue
+        target = new_dir / f.name
+        data = None
+        if new_folder:
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = None  # unreadable backup: move it as-is
+        if isinstance(data, dict):
+            data["folder"] = new_folder
+            _atomic_write_text(target, json.dumps(data, indent=2))
+            if f != target:
+                f.unlink()
+        elif f != target:
+            f.rename(target)
+    if old_dir != new_dir:
+        _remove_empty_dirs(old_dir,
+                           (BACKUPS_ROOT / _workspace_id(workspace_root)).resolve())
 
 
 def delete_all_backups(workspace_root: str | Path, pid: str) -> None:
     """Permanently remove all backup files for a playlist.
 
-    Only deletes .json files from ~/.echolist/backups/{wid}/{pid}/.
-    Validates the resolved path is inside BACKUPS_ROOT to prevent traversal.
+    Only deletes .json files from ~/.echolist/backups/{wid}/{pid}/. Only
+    top-level pids are listed as deleted playlists, so separators are refused.
     """
-    if not pid or ".." in pid or "/" in pid or "\\" in pid:
-        raise ValueError(f"invalid playlist id: {pid!r}")
-    wid = _workspace_id(workspace_root)
-    backup_dir = (BACKUPS_ROOT / wid / pid).resolve()
-    if not str(backup_dir).startswith(str(BACKUPS_ROOT.resolve())):
-        raise ValueError(f"backup path escapes backups root: {backup_dir}")
+    backup_dir = _backup_dir(workspace_root, pid)
     if not backup_dir.exists():
         return
     for f in backup_dir.iterdir():
         if f.is_file() and f.suffix == ".json":
             f.unlink()
-    try:
-        backup_dir.rmdir()
-    except OSError:
-        pass
+    _remove_empty_dirs(backup_dir,
+                       (BACKUPS_ROOT / _workspace_id(workspace_root)).resolve())
 
 
 def load_backup(workspace_root: str | Path, pid: str, timestamp: str) -> dict | None:
