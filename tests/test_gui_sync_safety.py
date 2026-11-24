@@ -311,10 +311,6 @@ def test_reorder_with_pending_remove_keeps_intended_order(app, gui_env):
     assert _titles(app, pid) == ["Song Four", "Song Two", "Song Three"]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "needs CORE A5: manager.remove_track drops the track from the Store "
-    "before deleting the file, so a failed delete loses the entry. Remove "
-    "this marker when the CORE fix lands (strict: it then XPASSes and fails)."))
 def test_failed_remove_keeps_reorder_and_remove_valid(app, gui_env):
     """#3/#6: after a partial sync the remaining staged ops still point at the
     right tracks (keys are rebased onto the new store).
