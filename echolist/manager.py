@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import re
 import threading
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 
 _MAX_TAG_WORKERS = 8
@@ -117,6 +119,15 @@ class PlaylistManager:
         if pid in self.store.playlists:
             raise ValueError(f"playlist '{pid}' already exists")
         folder = sanitize(name)
+        # FAT32 folder names are case-insensitive: two playlists whose folders
+        # differ only by case (or an older store whose pid predates
+        # playlist_id() sanitizing) would share one folder on the card.
+        for other_pid, other in self.store.playlists.items():
+            if other["folder"].casefold() == folder.casefold():
+                raise ValueError(
+                    f"playlist folder '{folder}' is already used by "
+                    f"playlist '{other['name']}'"
+                )
         # TODO: star prefix feature disabled — re-enable when stable
         # if self.config.star_prefix:
         #     folder = f"★ {folder}"
@@ -167,26 +178,31 @@ class PlaylistManager:
             return False
 
         disk_files = sorted(
-            f for f in folder_path.iterdir()
-            if _is_real_audio(f) and not f.name.startswith("_echolist_tmp_")
+            (f for f in folder_path.iterdir()
+             if _is_real_audio(f) and not f.name.startswith("_echolist_tmp_")),
+            key=lambda f: _track_sort_key(f.name),
         )
 
-        by_name = {t["copy_name"]: t for t in playlist["tracks"]}
+        # Compare names in NFC: macOS returns NFD directory entries while
+        # playlists.json (written from tags / Tk input) holds NFC. The stored
+        # copy_name is taken from disk so later path operations hit the file.
+        by_name = {_nfc(t["copy_name"]): t for t in playlist["tracks"]}
         by_title = {}
         for t in playlist["tracks"]:
-            title_part = _strip_index_prefix(t["copy_name"])
+            title_part = _strip_index_prefix(_nfc(t["copy_name"]))
             if title_part not in by_title:
                 by_title[title_part] = t
 
         new_tracks = []
         matched_ids = set()
         for i, f in enumerate(disk_files, 1):
-            if f.name in by_name:
-                entry = {**by_name[f.name], "index": i, "copy_name": f.name}
+            disk_name = _nfc(f.name)
+            if disk_name in by_name and id(by_name[disk_name]) not in matched_ids:
+                entry = {**by_name[disk_name], "index": i, "copy_name": f.name}
                 new_tracks.append(entry)
-                matched_ids.add(id(by_name[f.name]))
+                matched_ids.add(id(by_name[disk_name]))
             else:
-                title_part = _strip_index_prefix(f.name)
+                title_part = _strip_index_prefix(disk_name)
                 if title_part in by_title and id(by_title[title_part]) not in matched_ids:
                     old = by_title[title_part]
                     entry = {**old, "index": i, "copy_name": f.name}
@@ -322,7 +338,11 @@ class PlaylistManager:
             )
         else:
             workspace_bytes = 0
-        device_root = self.writer.root.parent.parent
+        # writer.root is <device>/<playlist_folder>; walk the device only.
+        # (.parent.parent was /Volumes on macOS — every mounted volume.)
+        device_root = self.writer.root
+        for _ in Path(self.config.playlist_folder).parts:
+            device_root = device_root.parent
         device_tracks = _count_audio_files(device_root)
         return device_tracks, workspace_bytes
 
@@ -814,6 +834,22 @@ def _blake2b(path: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _nfc(name: str) -> str:
+    return unicodedata.normalize("NFC", name)
+
+
+_INDEX_PREFIX = re.compile(r"^(\d+) - ")
+
+
+def _track_sort_key(name: str) -> tuple:
+    """Order by the numeric "NN - " prefix, so "100 - x" follows "99 - y"
+    even when 2- and 3-digit prefixes are mixed; unprefixed names go last."""
+    m = _INDEX_PREFIX.match(name)
+    if m:
+        return (0, int(m.group(1)), name)
+    return (1, 0, name)
 
 
 def _strip_index_prefix(name: str) -> str:

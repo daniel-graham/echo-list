@@ -43,14 +43,31 @@ class SafeWriter:
         return p
 
     def copy_in(self, src, rel, progress_cb=None, compute_hash=False):
+        """Copy src into the workspace at rel, atomically and durably.
+
+        The bytes go to a hidden ``.part`` temp file in the destination
+        directory, are fsynced, and only then renamed over ``rel``. A failure
+        part-way (ENOSPC, card pulled, progress_cb raising) removes the temp
+        file and leaves nothing at ``rel``. The ``.part`` suffix is not an
+        audio extension, so a temp file stranded by a hard crash is never
+        adopted as a track by ``rescan_playlist``.
+
+        Only timestamps are carried over from src — never permission bits or
+        BSD flags, which would make the copy read-only (un-taggable) or fail
+        outright on FAT32 (see review finding #10).
+        """
         dest = self._resolve(rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if progress_cb or compute_hash:
-            src = Path(src)
-            total = src.stat().st_size
-            copied = 0
-            h = hashlib.blake2b() if compute_hash else None
-            with open(src, "rb") as fsrc, open(dest, "wb") as fdst:
+        src = Path(src)
+        st = src.stat()
+        total = st.st_size
+        h = hashlib.blake2b() if compute_hash else None
+        fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".echolist-copy-",
+                                   suffix=".part")
+        try:
+            with open(src, "rb") as fsrc, os.fdopen(fd, "wb") as fdst:
+                fd = -1  # now owned by fdst
+                copied = 0
                 while True:
                     buf = fsrc.read(1024 * 256)
                     if not buf:
@@ -61,11 +78,16 @@ class SafeWriter:
                     copied += len(buf)
                     if progress_cb:
                         progress_cb(copied, total)
-            shutil.copystat(src, dest)
-            return dest, h.hexdigest() if h else None
-        else:
-            shutil.copy2(src, dest)
-            return dest, None
+                fdst.flush()
+                os.fsync(fdst.fileno())
+            os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+            os.replace(tmp, dest)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            _unlink_quiet(tmp)
+            raise
+        return dest, h.hexdigest() if h else None
 
     def delete(self, rel) -> None:
         p = self._resolve(rel)
@@ -87,21 +109,35 @@ class SafeWriter:
         return self._resolve(rel)
 
 
+def _unlink_quiet(path) -> None:
+    """Remove a temp file during error cleanup; it may already be gone."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """os.write may write fewer bytes than asked; loop until all are written."""
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
 def _atomic_write(dest: Path, data: bytes) -> None:
-    """Write data to dest atomically via temp-file + os.replace."""
+    """Write data to dest atomically via temp-file + fsync + os.replace."""
     fd, tmp = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
     try:
-        os.write(fd, data)
+        _write_all(fd, data)
+        os.fsync(fd)
         os.close(fd)
         fd = -1
         os.replace(tmp, dest)
     except BaseException:
         if fd >= 0:
             os.close(fd)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        _unlink_quiet(tmp)
         raise
 
 
