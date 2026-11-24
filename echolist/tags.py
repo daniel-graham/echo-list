@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
 import mutagen
@@ -11,6 +12,7 @@ from mutagen.flac import FLAC
 from mutagen.easymp4 import EasyMP4
 from mutagen.mp4 import MP4
 from mutagen.id3 import ID3, ID3NoHeaderError, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK
+from mutagen._util import delete_bytes, insert_bytes
 from mutagen.wave import WAVE
 
 from .formats import TAG_KINDS
@@ -74,8 +76,61 @@ class _ID3File:
     def save(self) -> None:
         if self._container is not None:
             self._container.save()
+            if isinstance(self._container, WAVE):
+                _move_wav_id3_before_data(self.path)
         else:
             self.tags.save(self.path)
+
+
+def _riff_chunks(f) -> list[tuple[bytes, int, int]] | None:
+    """(id, offset, length incl. header and pad byte) of each top-level chunk,
+    or None if the chunks don't tile the file (e.g. an odd-sized chunk written
+    without its pad byte), in which case the layout is left alone."""
+    f.seek(0, 2)
+    end = f.tell()
+    chunks, off = [], 12
+    while off + 8 <= end:
+        f.seek(off)
+        cid, size = struct.unpack("<4sI", f.read(8))
+        length = 8 + size + (size & 1)
+        chunks.append((cid, off, length))
+        off += length
+    if off == end or (chunks and off == end + 1):  # last chunk may lack its pad byte
+        return chunks
+    return None
+
+
+def _move_wav_id3_before_data(path: Path) -> None:
+    """Put a WAV's ID3 chunk ahead of its ``data`` chunk.
+
+    Mutagen appends a new ID3 chunk after the audio. Many portable players
+    only read chunks that come before ``data`` (they stop parsing there), so a
+    tag at the end is never shown. Only the tag chunk moves; the audio bytes
+    are shifted, not changed.
+    """
+    with open(path, "r+b") as f:
+        if f.read(12)[:4] != b"RIFF":
+            return
+        chunks = _riff_chunks(f)
+        if chunks is None:
+            return
+        data = next((c for c in chunks if c[0] == b"data"), None)
+        id3 = next((c for c in chunks if c[0].lower() == b"id3 "), None)
+        if data is None or id3 is None or id3[1] < data[1]:
+            return
+        f.seek(id3[1])
+        blob = f.read(id3[2])
+        stored = len(blob)  # shorter than id3[2] if the final pad byte is missing
+        if stored % 2:
+            blob += b"\0"
+        delete_bytes(f, stored, id3[1])
+        insert_bytes(f, len(blob), data[1])
+        f.seek(data[1])
+        f.write(blob)
+        f.seek(0, 2)
+        riff_size = f.tell() - 8
+        f.seek(4)
+        f.write(struct.pack("<I", riff_size))
 
 
 def tags_supported(path: Path) -> bool:
