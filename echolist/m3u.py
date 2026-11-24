@@ -35,7 +35,7 @@ def parse_m3u(m3u_path: Path, source_root: Path | None = None) -> dict:
             if line.upper().startswith("#PLAYLIST:"):
                 name = line.split(":", 1)[1].strip() or name
             continue
-        if line.startswith(("http://", "https://", "mms://", "rtsp://")):
+        if line.lower().startswith(("http://", "https://", "mms://", "rtsp://")):
             continue
 
         if line[:7].lower() == "file://":
@@ -61,7 +61,8 @@ def _file_uri_to_path(uri: str) -> str | None:
     as a local path.
     """
     parts = urlsplit(uri)
-    if parts.netloc not in ("", "localhost"):
+    # Host names are case-insensitive (file://LOCALHOST/...); the path is not.
+    if (parts.hostname or "") not in ("", "localhost") or parts.port is not None:
         return None
     # url2pathname percent-decodes (and handles drive letters on Windows).
     return url2pathname(parts.path)
@@ -85,19 +86,23 @@ def _resolve_entry(entry: str, m3u_dir: Path, source_root: Path | None) -> Path 
 
 
 def curate_playlist_name(raw_name: str, existing_names: set[str]) -> str:
-    """Clean up a playlist name from a filename, avoiding collisions."""
+    """Clean up a playlist name from a filename, avoiding collisions.
+
+    ``existing_names`` holds playlist ids. The " (N)" suffix is appended to
+    a base shortened enough that sanitize()'s length limit cannot cut the
+    suffix off again, so every returned name has a free id.
+    """
     from .naming import sanitize, playlist_id
 
-    name = sanitize(raw_name)
-    pid = playlist_id(name)
-    if pid not in existing_names:
+    # Playlist folders can't start with a dot (see check_playlist_folder_name).
+    name = sanitize(sanitize(raw_name).lstrip(". "))
+    if playlist_id(name) not in existing_names:
         return name
 
     n = 2
     while True:
-        candidate = f"{name} ({n})"
+        suffix = f" ({n})"
+        candidate = f"{sanitize(name, maxlen=60 - len(suffix))}{suffix}"
         if playlist_id(candidate) not in existing_names:
             return candidate
         n += 1
-        if n > 100:
-            return f"{name} ({id(raw_name) % 10000})"

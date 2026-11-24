@@ -404,7 +404,9 @@ def test_copy_in_before_commit_runs_on_temp_then_fsyncs(tmp_path, monkeypatch):
         assert tmp.name.endswith(".part") and tmp.read_bytes() == b"x" * 100
         tmp.write_bytes(b"y" * 100)
 
+    (tmp_path / "ws").mkdir()
     w = SafeWriter(tmp_path / "ws")
     dest, _ = w.copy_in(src, "a.flac", before_commit=edit)
     assert dest.read_bytes() == b"y" * 100
-    assert events == ["callback", "fsync", "replace"]
+    # (then the directory is fsynced too, where supported)
+    assert events[:3] == ["callback", "fsync", "replace"]

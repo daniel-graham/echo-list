@@ -62,6 +62,7 @@ def test_copy_in_fsyncs_before_rename(tmp_path, monkeypatch):
                         lambda a, b: (events.append("replace"), real_replace(a, b)))
     src = tmp_path / "a.flac"
     src.write_bytes(b"x" * 1000)
+    (tmp_path / "ws").mkdir()
     w = SafeWriter(tmp_path / "ws")
     dest, _ = w.copy_in(src, "a.flac")
     assert dest.read_bytes() == b"x" * 1000

@@ -1,4 +1,5 @@
-"""Sync journal — crash-safe record of in-progress sync operations."""
+"""Sync journal — an atomically written record of in-progress sync operations,
+so an interrupted sync can be detected and resumed."""
 
 from __future__ import annotations
 
