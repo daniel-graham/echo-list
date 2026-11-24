@@ -341,3 +341,70 @@ def test_untaggable_formats_not_reported_as_fixable(manager, source, ext):
 
     assert manager.audit_playlist_metadata(pid) == []
     assert manager.fix_playlist_metadata(pid) == 0
+
+
+# ── Tagging happens before the copy gets its final name ──
+
+def test_tag_failure_leaves_no_untagged_copy(manager, source, monkeypatch):
+    import mutagen
+    import echolist.tags as tags_mod
+
+    def boom(*a, **k):
+        raise mutagen.MutagenError("card pulled mid tag write")
+
+    monkeypatch.setattr(tags_mod, "_tag_flac", boom)
+    pid = manager.create_playlist("Mix")
+    with pytest.raises(mutagen.MutagenError):
+        manager.add_track(pid, source / "ArtistA" / "Album1" / "01 Song One.flac")
+
+    folder = manager.writer.root / "Mix"
+    assert list(folder.iterdir()) == []
+    manager.rescan_playlist(pid)
+    assert manager.store.playlists[pid]["tracks"] == []
+
+
+@pytest.mark.parametrize("ext,make", [(".flac", None), (".wav", _make_wav)])
+def test_copy_is_tagged_when_it_appears(manager, source, monkeypatch, ext, make):
+    """The file at the final name is already tagged the moment it exists."""
+    import echolist.safe_write as safe_write
+    seen = {}
+    real_replace = safe_write.os.replace
+
+    def spy(a, b):
+        if Path(b).suffix == ext:  # not the store's own playlists.json write
+            seen["tmp_album"] = read_playlist_tags(Path(a), suffix=ext)["album"]
+        return real_replace(a, b)
+
+    monkeypatch.setattr(safe_write.os, "replace", spy)
+    src = source / "ArtistA" / "Album1" / "01 Song One.flac"
+    if make:
+        src = source / "W" / f"W{ext}"
+        make(src)
+    pid = manager.create_playlist("Mix")
+    manager.add_track(pid, src)
+    assert seen["tmp_album"] == "Mix"
+
+
+def test_copy_in_before_commit_runs_on_temp_then_fsyncs(tmp_path, monkeypatch):
+    import os
+    import echolist.safe_write as safe_write
+    from echolist.safe_write import SafeWriter
+
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(safe_write.os, "fsync",
+                        lambda fd: (events.append("fsync"), real_fsync(fd)))
+    monkeypatch.setattr(safe_write.os, "replace",
+                        lambda a, b: (events.append("replace"), real_replace(a, b)))
+    src = tmp_path / "a.flac"
+    src.write_bytes(b"x" * 100)
+
+    def edit(tmp):
+        events.append("callback")
+        assert tmp.name.endswith(".part") and tmp.read_bytes() == b"x" * 100
+        tmp.write_bytes(b"y" * 100)
+
+    w = SafeWriter(tmp_path / "ws")
+    dest, _ = w.copy_in(src, "a.flac", before_commit=edit)
+    assert dest.read_bytes() == b"y" * 100
+    assert events == ["callback", "fsync", "replace"]

@@ -14,7 +14,7 @@ from mutagen.id3 import TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK
 from mutagen.wave import WAVE
 
 # Containers that carry their tags in an embedded ID3v2 chunk.
-_ID3_CHUNK_TYPES = {".wav": WAVE, ".aiff": AIFF}
+_ID3_CHUNK_TYPES = {".wav": WAVE, ".aiff": AIFF}  # suffix -> mutagen class
 _MP4_EXTS = (".m4a", ".mp4")
 
 # Errors mutagen raises for unreadable or malformed files (it wraps I/O
@@ -31,8 +31,11 @@ def _is_mp4_container(path: Path) -> bool:
     return isinstance(mutagen.File(path), MP4)
 
 
-def _tag_kind(path: Path) -> str | None:
-    suffix = path.suffix.lower()
+def _tag_kind(path: Path, suffix: str | None = None) -> str | None:
+    """How to tag this file: "flac", "mp3", "mp4", a ".wav"/".aiff" key of
+    _ID3_CHUNK_TYPES, or None. ``suffix`` overrides path.suffix, for tagging
+    a temp copy (``.part``) that will be renamed to its real name."""
+    suffix = (suffix if suffix is not None else path.suffix).lower()
     if suffix == ".flac":
         return "flac"
     if suffix == ".mp3":
@@ -42,7 +45,7 @@ def _tag_kind(path: Path) -> str | None:
     if suffix == ".aac":
         return "mp4" if _is_mp4_container(path) else None
     if suffix in _ID3_CHUNK_TYPES:
-        return "id3chunk"
+        return suffix
     return None
 
 
@@ -59,8 +62,9 @@ def read_title(path: Path) -> str | None:
     """The file's title tag, or None if it has none / can't be read."""
     path = Path(path)
     try:
-        if _tag_kind(path) == "id3chunk":
-            tags = _ID3_CHUNK_TYPES[path.suffix.lower()](path).tags
+        kind = _tag_kind(path)
+        if kind in _ID3_CHUNK_TYPES:
+            tags = _ID3_CHUNK_TYPES[kind](path).tags
             title = _id3_text(tags, "TIT2") if tags is not None else ""
             return title or None
         m = mutagen.File(path, easy=True)
@@ -80,24 +84,27 @@ def _normalize_tracknumber(raw: str) -> str:
 
 
 def apply_playlist_tags(
-    path: Path, node_name: str, album: str, index: int, src_rel: str, playlist_id: str
+    path: Path, node_name: str, album: str, index: int, src_rel: str, playlist_id: str,
+    suffix: str | None = None,
 ) -> None:
-    kind = _tag_kind(path)
+    """Tag a playlist copy. ``suffix`` is the copy's real extension when
+    ``path`` is a temp file with a different one (see SafeWriter.copy_in)."""
+    kind = _tag_kind(path, suffix)
     if kind == "flac":
         _tag_flac(path, node_name, album, index, src_rel, playlist_id)
     elif kind == "mp3":
         _tag_easy(EasyID3, path, node_name, album, index)
     elif kind == "mp4":
         _tag_easy(EasyMP4, path, node_name, album, index)
-    elif kind == "id3chunk":
-        _tag_id3_chunk(path, node_name, album, index)
+    elif kind in _ID3_CHUNK_TYPES:
+        _tag_id3_chunk(path, kind, node_name, album, index)
 
 
-def read_playlist_tags(path: Path) -> dict:
+def read_playlist_tags(path: Path, suffix: str | None = None) -> dict:
     """Read the metadata fields EchoList cares about from a track file."""
     result = {"albumartist": "", "album": "", "tracknumber": "", "title": "", "artist": ""}
     try:
-        kind = _tag_kind(path)
+        kind = _tag_kind(path, suffix)
         if kind == "flac":
             f = FLAC(path)
             result["albumartist"] = (f.get("ALBUMARTIST") or [""])[0]
@@ -113,8 +120,8 @@ def read_playlist_tags(path: Path) -> dict:
             result["tracknumber"] = _normalize_tracknumber((tags.get("tracknumber") or [""])[0])
             result["title"] = (tags.get("title") or [""])[0]
             result["artist"] = (tags.get("artist") or [""])[0]
-        elif kind == "id3chunk":
-            tags = _ID3_CHUNK_TYPES[path.suffix.lower()](path).tags
+        elif kind in _ID3_CHUNK_TYPES:
+            tags = _ID3_CHUNK_TYPES[kind](path).tags
             if tags is not None:
                 for field, frame_id in _ID3_FIELD_FRAMES.items():
                     result[field] = _id3_text(tags, frame_id)
@@ -148,8 +155,8 @@ def restore_tags(path: Path, tags: dict) -> None:
                 elif field in t:
                     del t[field]
             t.save(path)
-        elif kind == "id3chunk":
-            f = _load_id3_chunk(path)
+        elif kind in _ID3_CHUNK_TYPES:
+            f = _load_id3_chunk(path, kind)
             for field, frame_id in _ID3_FIELD_FRAMES.items():
                 if cleaned.get(field):
                     _id3_set(f.tags, frame_id, cleaned[field])
@@ -267,7 +274,8 @@ _ID3_FRAME_CLASSES = {
 # stripped exactly like MP3 copies. Kept in sync by
 # tests/test_tags_numbering.py::test_wav_strip_frames_match_mp3_strip_list.
 _ID3_STRIP_FRAMES = frozenset({
-    "TSO2", "TSOP", "TSOC", "TCMP", "TMED", "TPUB",
+    "TSO2", "TXXX:ALBUMARTISTSORT",  # albumartistsort: mutagen >=1.48 / <1.48
+    "TSOP", "TSOC", "TCMP", "TMED", "TPUB",
     "TXXX:BARCODE", "TXXX:CATALOGNUMBER", "TXXX:ASIN",
     "TXXX:MusicBrainz Album Artist Id", "TXXX:MusicBrainz Album Id",
     "TXXX:MusicBrainz Artist Id", "UFID:http://musicbrainz.org",
@@ -285,18 +293,18 @@ def _id3_set(tags, frame_id: str, value: str) -> None:
     tags.setall(frame_id, [_ID3_FRAME_CLASSES[frame_id](encoding=3, text=[value])])
 
 
-def _load_id3_chunk(path: Path):
+def _load_id3_chunk(path: Path, kind: str):
     """Open a WAV/AIFF file, adding an empty ID3 chunk if it has none."""
-    f = _ID3_CHUNK_TYPES[path.suffix.lower()](path)
+    f = _ID3_CHUNK_TYPES[kind](path)
     if f.tags is None:
         f.add_tags()
     return f
 
 
-def _tag_id3_chunk(path: Path, node_name: str, album: str, index: int) -> None:
+def _tag_id3_chunk(path: Path, kind: str, node_name: str, album: str, index: int) -> None:
     """Tag a WAV/AIFF copy. mutagen rewrites only the ID3 chunk (and the
     RIFF/FORM size); the audio chunk bytes are untouched."""
-    f = _load_id3_chunk(path)
+    f = _load_id3_chunk(path, kind)
     tags = f.tags
     for key in [k for k in tags.keys() if k in _ID3_STRIP_FRAMES]:
         del tags[key]

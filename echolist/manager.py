@@ -252,16 +252,18 @@ class PlaylistManager:
 
         original_tags = read_playlist_tags(src)
 
-        _, src_hash = self.writer.copy_in(src, rel, progress_cb=progress_cb, compute_hash=True)
-
         album = self.config.album_prefix + playlist["name"]
-        apply_playlist_tags(
-            self.writer.resolve(rel),
-            self.config.node_name,
-            album,
-            index,
-            src_rel,
-            pid,
+
+        def _tag_temp_copy(tmp: Path) -> None:
+            apply_playlist_tags(
+                tmp, self.config.node_name, album, index, src_rel, pid, suffix=ext,
+            )
+
+        # Tag the temp copy before it gets its final name, so a failed tag
+        # write never leaves an untagged track for rescan to adopt.
+        _, src_hash = self.writer.copy_in(
+            src, rel, progress_cb=progress_cb, compute_hash=True,
+            before_commit=_tag_temp_copy,
         )
 
         self.store.add_track(pid, {
