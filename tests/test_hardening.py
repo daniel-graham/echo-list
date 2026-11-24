@@ -35,7 +35,7 @@ def large_source(tmp_path):
 
 
 def test_large_playlist_three_digit_padding(large_source, tmp_path):
-    """Playlists with >99 tracks use 3-digit zero-padded filenames."""
+    """Playlists with >99 tracks use 3-digit zero-padded filenames throughout."""
     dest = tmp_path / "card"
     dest.mkdir()
     mgr = PlaylistManager.init(large_source, dest)
@@ -46,9 +46,9 @@ def test_large_playlist_three_digit_padding(large_source, tmp_path):
 
     tracks = mgr.store.playlists[pid]["tracks"]
     assert len(tracks) == 105
-    # First 99 tracks are added with 2-digit padding; track 100+ get 3-digit
-    assert tracks[0]["copy_name"].startswith("01 - ")
-    assert tracks[98]["copy_name"].startswith("99 - ")
+    # Crossing 100 re-pads the earlier tracks so names sort in playlist order
+    assert tracks[0]["copy_name"].startswith("001 - ")
+    assert tracks[98]["copy_name"].startswith("099 - ")
     assert tracks[99]["copy_name"].startswith("100 - ")
     assert tracks[104]["copy_name"].startswith("105 - ")
 

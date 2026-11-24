@@ -21,13 +21,10 @@ from .config import (
     save_playlist_snapshot, load_playlist_snapshot,
 )
 from .store import Store
-from .naming import playlist_id, sanitize, track_filename
-from .tags import apply_playlist_tags, read_playlist_tags, restore_tags
-
-try:
-    import mutagen
-except ImportError:
-    mutagen = None
+from .naming import INDEX_PREFIX_RE, pad_width, playlist_id, sanitize, track_filename
+from .tags import (
+    apply_playlist_tags, read_playlist_tags, read_title, restore_tags, tags_supported,
+)
 
 
 class WorkspaceLockError(Exception):
@@ -249,8 +246,7 @@ class PlaylistManager:
         title = _read_title(src)
         ext = src.suffix
         index = len(playlist["tracks"]) + 1
-        pad = 3 if index > 99 else 2
-        copy_name = track_filename(index, title, ext, pad)
+        copy_name = track_filename(index, title, ext, pad_width(index))
         folder = playlist["folder"]
         rel = f"{folder}/{copy_name}"
 
@@ -275,6 +271,9 @@ class PlaylistManager:
             "src_hash": f"blake2b:{src_hash}",
             "original_tags": original_tags,
         })
+        if pad_width(index) != pad_width(index - 1):
+            # Crossed 99 -> 100 (or 999 -> 1000): re-pad the earlier tracks.
+            self._renumber_tracks(pid)
         self.store.save()
         return rel
 
@@ -288,21 +287,57 @@ class PlaylistManager:
         self.store.save()
 
     def _renumber_tracks(self, pid: str) -> None:
+        """Make every file name and embedded track number match t["index"].
+
+        All names share one pad width (see naming.pad_width). A file whose
+        TRACKNUMBER no longer matches its index is re-tagged, so the player's
+        album view keeps playlist order after removes.
+        """
         playlist = self.store.playlists[pid]
         folder = playlist["folder"]
+        folder_path = self.writer.root / folder
         tracks = playlist["tracks"]
-        pad = 3 if len(tracks) > 99 else 2
+        pad = pad_width(len(tracks))
+
+        plan = []
         for t in tracks:
             old_name = t["copy_name"]
-            title = old_name.split(" - ", 1)[-1].rsplit(".", 1)[0]
-            ext = Path(old_name).suffix
-            new_name = track_filename(t["index"], title, ext, pad)
+            new_name = track_filename(
+                t["index"], _title_from_copy_name(folder_path / old_name), Path(old_name).suffix, pad,
+            )
+            plan.append((t, old_name, new_name))
+
+        # A target may still be held by a track that has not moved yet
+        # (e.g. adopted "001 - Y" -> "01 - Y" while "01 - Y" -> "02 - Y").
+        # Path.rename would silently overwrite it, so move those out of the
+        # way first under a name rescan still recognises as audio.
+        pending = {old for _, old, new in plan if old != new}
+        targets = {new for _, old, new in plan if old != new}
+        for i, (t, old_name, new_name) in enumerate(plan):
+            if old_name != new_name and old_name in targets:
+                parked = f"_echolist_renumber_{i}_{old_name}"
+                self.writer.rename(f"{folder}/{old_name}", f"{folder}/{parked}")
+                pending.discard(old_name)
+                t["copy_name"] = parked
+                plan[i] = (t, parked, new_name)
+
+        for t, old_name, new_name in plan:
             if old_name != new_name:
-                try:
-                    self.writer.rename(f"{folder}/{old_name}", f"{folder}/{new_name}")
-                    t["copy_name"] = new_name
-                except Exception:
-                    pass
+                if new_name in pending:
+                    raise RuntimeError(f"renumber would overwrite {folder}/{new_name}")
+                self.writer.rename(f"{folder}/{old_name}", f"{folder}/{new_name}")
+                pending.discard(old_name)
+                t["copy_name"] = new_name
+
+        album = self.config.album_prefix + playlist["name"]
+        for t in tracks:
+            path = folder_path / t["copy_name"]
+            if not path.exists() or not tags_supported(path):
+                continue
+            if read_playlist_tags(path)["tracknumber"] != str(t["index"]):
+                apply_playlist_tags(
+                    path, self.config.node_name, album, t["index"], t.get("src_path", ""), pid,
+                )
 
     def stats(self, cached_device_tracks: int | None = None,
               cached_workspace_bytes: int | None = None) -> dict:
@@ -371,7 +406,9 @@ class PlaylistManager:
             track_path = folder_path / copy_name
             if not track_path.exists():
                 continue
-            if track_path.suffix.lower() not in AUDIO_EXTS:
+            if not tags_supported(track_path):
+                # OGG, WMA, DSF, raw ADTS AAC...: copied but never tagged,
+                # so they can't be "fixed" either.
                 continue
 
             tags = read_playlist_tags(track_path)
@@ -858,14 +895,19 @@ def _strip_index_prefix(name: str) -> str:
 
 
 def _read_title(path: Path) -> str:
-    if mutagen is None:
-        return path.stem
-    try:
-        m = mutagen.File(path, easy=True)
-        if m and "title" in m:
-            return m["title"][0]
-    except Exception:
-        pass
-    return path.stem
+    return read_title(path) or path.stem
+
+
+def _title_from_copy_name(path: Path) -> str:
+    """Title part of a playlist file name, for renaming it to a new index.
+
+    EchoList names look like "07 - Title.ext": drop only that numeric prefix.
+    Anything else (an adopted "01. Song.flac" or "Band - Title.flac") is
+    named the way add_track names copies: from the title tag, else the stem.
+    """
+    stem = path.stem
+    if INDEX_PREFIX_RE.match(stem):
+        return INDEX_PREFIX_RE.sub("", stem, count=1)
+    return _read_title(path)
 
 
