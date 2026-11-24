@@ -608,3 +608,188 @@ def test_add_published_before_store_save_is_not_copied_twice(app, gui_env):
     assert app._do_sync_blocking() == []
     assert _titles(app, pid) == ["Song One", "Song Two"]
     assert _track(app, pid, 2)["src_path"] == "ArtistB/Album2/03 Song Two.flac"
+
+
+# ── A21 / N19: restores stage under the playlist they actually created ──
+
+def test_snapshot_restore_stages_under_the_created_playlist_id(app, gui_env, tmp_path):
+    """A21/N19: snapshot restore staged adds under the snapshot's (legacy) pid
+    although create_playlist() returned a different one, so every restored
+    track failed to sync."""
+    card = tmp_path / "card2"
+    card.mkdir()
+    snapshot = {
+        "config": {"source_root": str(gui_env["src"]),
+                   "playlist_folder": gui.DEFAULT_PLAYLIST_FOLDER},
+        "store": {"schema": 1, "playlists": {"ac/dc": {
+            "name": "AC/DC", "folder": "AC_DC",
+            "tracks": [{"index": 1, "copy_name": "01 - Song One.flac",
+                        "src_path": "ArtistA/Album1/01 Song One.flac"}]}}},
+    }
+    app.mgr.release_lock()
+    with patch.object(gui.PlaylistManager, "find_snapshot", return_value=snapshot), \
+            patch("echolist.gui.messagebox.askyesno", return_value=True), \
+            patch("echolist.gui.messagebox.showwarning"), \
+            patch("echolist.gui.messagebox.showinfo"):
+        app._open_workspace(str(gui_env["src"]), str(card))
+    pump(app)
+
+    [pid] = list(app.mgr.store.playlists)
+    assert [a["pid"] for a in app.staging.pending_adds] == [pid]
+    assert app._do_sync_blocking() == []
+    assert _titles(app, pid) == ["Song One"]
+
+
+def test_restore_deleted_stages_under_the_recreated_playlist_id(app, gui_env):
+    """A21/N19: a backup kept under an old pid ('old_mix') recreated the
+    playlist as playlist_id(name) but staged its tracks under 'old_mix'."""
+    from echolist.config import save_backup
+    from echolist.naming import playlist_id
+    save_backup(app.mgr.writer.root, "old_mix", "20200101_000000", {
+        "playlist_name": "Mix", "folder": "Mix",
+        "tracks": [{"copy_name": "01 - Song One.flac", "index": 1,
+                    "src_path": "ArtistA/Album1/01 Song One.flac"}]})
+    with _quiet():
+        app._restore_deleted("old_mix", "20200101_000000")
+        pump(app)
+
+    pid = playlist_id("Mix")
+    assert [a["pid"] for a in app.staging.pending_adds] == [pid]
+    assert app._do_sync_blocking() == []
+    assert _titles(app, pid) == ["Song One"]
+
+
+# ── A13 / N2 (GUI part): restores and staged changes ──
+
+def test_restore_point_is_refused_while_the_playlist_has_staged_changes(app, gui_env):
+    """A13/N2: restoring rewrote the playlist under staged removes/reorders
+    whose indices then pointed at other tracks."""
+    pid = _synced_playlist(app, gui_env, 2)
+    app.mgr.backup_playlist_metadata(pid, timestamp="20200101_000000")
+    app._stage_remove_track(pid, 1, _track(app, pid, 1)["copy_name"])
+    with patch.object(app.mgr, "restore_playlist_to_point") as restore, _quiet():
+        app._restore_from_point(pid, "20200101_000000")
+        pump(app)
+    restore.assert_not_called()
+    assert len(app.staging.pending_removes) == 1
+
+
+def test_undo_after_a_restore_does_not_unstage_its_tracks(app, gui_env):
+    """A13/N27: undo snapshots taken before a structural operation survived
+    it; undoing then silently dropped the tracks the restore had staged."""
+    pid = _synced_playlist(app, gui_env, 2)
+    app.mgr.backup_playlist_metadata(pid, timestamp="20200101_000000")
+    app._stage_remove_track(pid, 2, _track(app, pid, 2)["copy_name"])
+    assert app._do_sync_blocking() == []
+    app._create_playlist()
+    other = app.current_pid
+    app._stage_add_files(_sources(gui_env)[2:3])   # leaves an undo entry
+    app.current_pid = pid
+
+    with _quiet():
+        app._restore_from_point(pid, "20200101_000000")
+        pump(app)
+    assert any(a["pid"] == pid for a in app.staging.pending_adds)
+    app._do_undo()
+    assert any(a["pid"] == pid for a in app.staging.pending_adds)
+    assert any(a["pid"] == other for a in app.staging.pending_adds)
+
+
+# ── N7 / A19: WAV / AIFF titles ──
+
+def _make_tagged_wav(path, title, artist):
+    import wave
+    from mutagen.id3 import TIT2, TPE1
+    from mutagen.wave import WAVE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(b"\0\0" * 800)
+    f = WAVE(path)
+    f.add_tags()
+    f.tags.add(TIT2(encoding=3, text=title))
+    f.tags.add(TPE1(encoding=3, text=artist))
+    f.save()
+
+
+def test_wav_titles_are_shown_for_staged_and_synced_tracks(app, gui_env):
+    """N7/A19: titles were read with mutagen easy=True, which has no title key
+    for WAV/AIFF ID3 chunks, so these tracks showed blank."""
+    wav = gui_env["src"] / "Wav" / "take.wav"
+    _make_tagged_wav(wav, "Wave Song", "Wave Band")
+    app._create_playlist()
+    pid = app.current_pid
+    app._stage_add_files([wav])
+    assert (app.staging.pending_adds[0]["title"],
+            app.staging.pending_adds[0]["artist"]) == ("Wave Song", "Wave Band")
+    assert app._do_sync_blocking() == []
+    app._tag_cache.clear()
+    app._refresh_tracks()
+    pump(app)
+    rows = [app.track_tree.item(i, "values") for i in app.track_tree.get_children()]
+    assert [tuple(r[1:]) for r in rows] == [("Wave Song", "Wave Band")]
+
+
+def test_untagged_file_falls_back_to_its_name(app, gui_env):
+    """N7: an empty title displays the file stem, not a blank row."""
+    wav = gui_env["src"] / "Wav" / "untitled take.wav"
+    _make_tagged_wav(wav, "", "")
+    app._create_playlist()
+    app._stage_add_files([wav])
+    assert app.staging.pending_adds[0]["title"] == "untitled take"
+
+
+# ── N20: file-name search treats names literally ──
+
+def test_moved_source_with_brackets_in_its_name_is_found(app, gui_env):
+    """N20: the filename fallback used rglob(name) unescaped, so '[Remix]'
+    became a character class and the moved file was never found."""
+    moved = gui_env["src"] / "Moved" / "Song [Remix].flac"
+    _make_flac(moved, "ArtistR", "Song Remix")
+    root = Path(gui_env["src"]).resolve()
+    assert gui._resolve_source_file("Old/Song [Remix].flac", root) == moved.resolve()
+
+
+# ── N27: stale rows and stale reorders ──
+
+def test_remove_during_loading_does_not_use_the_previous_playlists_rows(app, gui_env):
+    """N27: _track_data kept the previous playlist's rows while 'Loading...'
+    was shown, so Delete staged a remove of the wrong track."""
+    app._create_playlist()
+    b = app.current_pid
+    app.mgr.add_track(b, _sources(gui_env)[2])
+    _synced_playlist(app, gui_env, 2)          # A's rows are on screen
+    assert len(app._track_data) == 2
+    app.current_pid = b
+    app._tag_cache.clear()                      # B's tags must load in the background
+    app._refresh_tracks()
+    assert app.track_tree.get_children() == ("_loading",)
+    app.track_tree.selection_set("_loading")
+    app._remove_track()
+    assert not app.staging.pending_removes
+    pump(app)
+
+
+def test_declining_an_orphan_remove_still_clears_the_shifted_reorder(app, gui_env):
+    """N27: answering No to the 'no source' prompt returned before
+    unstage_reorder, leaving a reorder whose p:N keys now named other adds."""
+    import shutil
+    pid = _synced_playlist(app, gui_env, 1)
+    folder = app.mgr.writer.root / app.mgr.store.playlists[pid]["folder"]
+    shutil.copy(_sources(gui_env)[3], folder / "02 - Stray.flac")  # no source
+    app._refresh_tracks()
+    pump(app)
+    app._stage_add_files(_sources(gui_env)[1:3])
+    app.staging.set_reorder(pid, [{"key": "p:1"}, {"key": "p:0"},
+                                  {"key": "c:1"}, {"key": "c:2"}])
+    app._refresh_tracks()
+    pump(app)
+    rows = {r["key"]: i for r, i in zip(app._track_data, app.track_tree.get_children())}
+    app.track_tree.selection_set([rows["p:0"], rows["c:2"]])
+    with patch("echolist.gui.messagebox.askyesno", return_value=False):
+        app._remove_track()
+
+    assert [a["title"] for a in app.staging.pending_adds] == ["Song Three"]
+    assert pid not in app.staging.pending_reorders
