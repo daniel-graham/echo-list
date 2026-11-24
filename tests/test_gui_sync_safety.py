@@ -7,7 +7,6 @@ comment on each test names the defect it pins down.
 import errno
 import signal
 import threading
-import time
 import unicodedata
 from pathlib import Path
 from unittest.mock import patch
@@ -17,7 +16,8 @@ import pytest
 import echolist.gui as gui
 from echolist.journal import SyncJournal
 from conftest import _make_flac
-from test_gui import app, gui_env, _flush_bg_ops, _flush_tracks  # noqa: F401  (fixtures)
+from test_gui import (app, gui_env, isolated_home, callback_errors,  # noqa: F401  (fixtures)
+                      pump, _flush_bg_ops, _flush_tracks)
 
 
 class Crash(BaseException):
@@ -90,12 +90,8 @@ def _reopen(app, gui_env):
     return _open(app, gui_env["src"], gui_env["dest"])
 
 
-def _wait_sync(app, timeout=10):
-    deadline = time.monotonic() + timeout
-    while app._syncing and time.monotonic() < deadline:
-        app.root.update()
-        time.sleep(0.02)
-    app.root.update()
+def _wait_sync(app):
+    pump(app)
 
 
 # ── #1 crash recovery must never delete audio ──
@@ -317,15 +313,18 @@ def test_reorder_with_pending_remove_keeps_intended_order(app, gui_env):
 
 def test_failed_remove_keeps_reorder_and_remove_valid(app, gui_env):
     """#3/#6: after a partial sync the remaining staged ops still point at the
-    right tracks (keys are rebased onto the new store)."""
+    right tracks (keys are rebased onto the new store).
+
+    T1: the failure is injected at the device delete (writer.delete), not by
+    replacing the whole manager.remove_track, so the test covers what
+    remove_track does to the Store when the delete fails."""
     pid = _synced_playlist(app, gui_env, 3)
     tracks = app.mgr.store.playlists[pid]["tracks"]
     app._stage_remove_track(pid, 1, tracks[0]["copy_name"])
     app._stage_add_files([_sources(gui_env)[3]])
     app.staging.set_reorder(pid, [{"key": "p:0"}, {"key": "c:3"}, {"key": "c:2"}])
 
-    real_remove = app.mgr.remove_track
-    with patch.object(app.mgr, "remove_track",
+    with patch.object(app.mgr.writer, "delete",
                       side_effect=PermissionError(errno.EACCES, "Permission denied")):
         errors = app._do_sync_blocking()
     assert errors
@@ -334,7 +333,7 @@ def test_failed_remove_keeps_reorder_and_remove_valid(app, gui_env):
     assert len(app.staging.pending_removes) == 1
     assert pid in app.staging.pending_reorders
 
-    assert real_remove  # second sync uses the real remove
+    _reopen(app, gui_env)
     assert app._do_sync_blocking() == []
     assert _titles(app, pid) == ["Song Four", "Song Three", "Song Two"]
 
