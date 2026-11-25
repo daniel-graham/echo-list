@@ -92,7 +92,6 @@ ALLOWED_CALLS = {
 
 ALLOWED_OPEN = {
     ("manager.py", "_blake2b"): "read-only hashing (mode 'rb')",
-    ("tags.py", "_move_wav_id3_before_data"): "moves a WAV copy's ID3 chunk ahead of its audio",
 }
 
 
